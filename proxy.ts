@@ -1,13 +1,12 @@
 // ============================================
-// NEXT.JS 15 PROXY (replaces middleware.ts)
-// Handles Supabase auth with async cookies
+// NEXT.JS 16 PROXY - FIXED VERSION
+// No more redirect loops!
 // ============================================
 
 import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function proxy(request: NextRequest) {
-  // Create response object
   let supabaseResponse = NextResponse.next({
     request,
   })
@@ -21,7 +20,7 @@ export async function proxy(request: NextRequest) {
           return request.cookies.getAll()
         },
         setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value, options }) =>
+          cookiesToSet.forEach(({ name, value }) =>
             request.cookies.set(name, value)
           )
           supabaseResponse = NextResponse.next({
@@ -35,50 +34,83 @@ export async function proxy(request: NextRequest) {
     }
   )
 
-  // IMPORTANT: Avoid writing any logic between createServerClient and
-  // supabase.auth.getUser(). A simple mistake could make it very hard to debug
-  // issues with users being randomly logged out.
-
   const {
     data: { user },
   } = await supabase.auth.getUser()
 
-  // Protected routes: redirect to login if not authenticated
-  if (
-    request.nextUrl.pathname.startsWith('/admin') &&
-    !user
-  ) {
-    // Redirect to login page
-    const url = request.nextUrl.clone()
-    url.pathname = '/login'
-    return NextResponse.redirect(url)
+  // ============================================
+  // ADMIN ROUTE PROTECTION (FIXED!)
+  // ============================================
+  
+  const pathname = request.nextUrl.pathname
+  
+  // 1. ALLOW /admin/login for everyone (no redirect!)
+  if (pathname === '/admin/login') {
+    // Only redirect logged-in admins away from login page
+    if (user) {
+      try {
+        const { data: profile } = await supabase
+          .from('user_profiles')
+          .select('role')
+          .eq('id', user.id)
+          .single()
+
+        const adminRoles = ['super_admin', 'content_admin', 'shop_admin', 'discussion_admin']
+        
+        if (profile && adminRoles.includes(profile.role)) {
+          // Already logged in as admin, go to dashboard
+          const url = request.nextUrl.clone()
+          url.pathname = '/admin'
+          return NextResponse.redirect(url)
+        }
+      } catch (error) {
+        console.error('Error checking user role:', error)
+      }
+    }
+    // Not logged in or not admin - allow access to login page
+    return supabaseResponse
   }
 
-  // IMPORTANT: You *must* return the supabaseResponse object as it is. If you're
-  // creating a new response object with NextResponse.next() make sure to:
-  // 1. Pass the request in it, like so:
-  //    const myNewResponse = NextResponse.next({ request })
-  // 2. Copy over the cookies, like so:
-  //    myNewResponse.cookies.setAll(supabaseResponse.cookies.getAll())
-  // 3. Change the myNewResponse object to fit your needs, but avoid changing
-  //    the cookies!
-  // 4. Finally:
-  //    return myNewResponse
-  // If this is not done, you may be causing the browser and server to go out
-  // of sync and terminate the user's session prematurely!
+  // 2. PROTECT /admin/* routes (except /admin/login which we handled above)
+  if (pathname.startsWith('/admin')) {
+    // Not logged in - redirect to login
+    if (!user) {
+      const url = request.nextUrl.clone()
+      url.pathname = '/admin/login'
+      url.searchParams.set('redirectTo', pathname)
+      return NextResponse.redirect(url)
+    }
+
+    // Logged in - check if admin
+    try {
+      const { data: profile } = await supabase
+        .from('user_profiles')
+        .select('role')
+        .eq('id', user.id)
+        .single()
+
+      const adminRoles = ['super_admin', 'content_admin', 'shop_admin', 'discussion_admin']
+      
+      if (!profile || !adminRoles.includes(profile.role)) {
+        // Not an admin - redirect to unauthorized
+        const url = request.nextUrl.clone()
+        url.pathname = '/unauthorized'
+        return NextResponse.redirect(url)
+      }
+    } catch (error) {
+      console.error('Error checking admin access:', error)
+      // On error, redirect to unauthorized
+      const url = request.nextUrl.clone()
+      url.pathname = '/unauthorized'
+      return NextResponse.redirect(url)
+    }
+  }
 
   return supabaseResponse
 }
 
 export const config = {
   matcher: [
-    /*
-     * Match all request paths except for the ones starting with:
-     * - _next/static (static files)
-     * - _next/image (image optimization files)
-     * - favicon.ico (favicon file)
-     * Feel free to modify this pattern to include more paths.
-     */
     '/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)',
   ],
 }
